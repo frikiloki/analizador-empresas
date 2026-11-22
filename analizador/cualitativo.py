@@ -27,8 +27,7 @@ CHECKLIST: dict[str, list[str]] = {
         "Acreedores y accionistas (nivel retail / instituciones)",
     ],
     "4. Equipo directivo": [
-        "Visión a largo plazo", "Fundadores en la empresa", "N.º de acciones de los directivos",
-        "Sueldo de los directivos",
+        "Visión a largo plazo", "Fundadores en la empresa", "Trayectoria y cambios recientes",
     ],
     "5. Moat": [
         "Cultura organizacional sólida (pertenencia, orientación al cliente, know-how)",
@@ -104,71 +103,122 @@ def ciclicidad(datos: DatosEmpresa) -> str:
 # Análisis con IA (opcional)
 # ---------------------------------------------------------------------------
 
-def _contexto(datos: DatosEmpresa, resultados, notas: dict) -> str:
-    perfil = {k: v for k, v in datos.perfil.items() if k != "descripcion"}
-    ins = resumen_insiders(datos)
-    ratios = [f"{r.punto}. {r.nombre}: {r.valor} (ideal {r.ideal}) -> {r.estado}" for r in resultados]
-    directivos = datos.directivos.head(10).to_dict(orient="records") if not datos.directivos.empty else []
-    return json.dumps({
-        "empresa": datos.nombre, "ticker": datos.ticker, "perfil": perfil,
-        "descripcion": datos.perfil.get("descripcion"),
-        "accionistas": datos.accionistas, "insiders_12_meses": ins,
-        "directivos": directivos, "ratios": ratios,
-        "notas_del_usuario": {k: v for k, v in notas.items() if v},
-    }, ensure_ascii=False, default=str)
+NOTICIAS = "Noticias recientes (últimos 12 meses)"
+
+# Qué datos de la app necesita cada bloque (para no enviar de más y gastar menos)
+_DATOS_POR_BLOQUE = {
+    "1. Modelo de negocio": {"descripcion", "ratios"},
+    "2. Entorno macro (PESTEL)": {"descripcion"},
+    "3. Entorno micro": {"descripcion", "ratios", "accionistas"},
+    "4. Equipo directivo": {"directivos", "insiders", "accionistas"},
+    "5. Moat": {"descripcion", "ratios"},
+}
+# Bloques en los que buscar en internet aporta de verdad
+_BLOQUES_CON_BUSQUEDA = {"2. Entorno macro (PESTEL)", "3. Entorno micro", "4. Equipo directivo", NOTICIAS}
 
 
-def analisis_ia(datos: DatosEmpresa, resultados, notas: dict, clave: str,
-                modelo: str = "claude-sonnet-5-5", buscar: bool = True,
-                max_busquedas: int = 5) -> dict:
-    """Devuelve {"texto", "fuentes": [(titulo, url)], "busquedas", "coste"}."""
+def _contexto(datos: DatosEmpresa, resultados, notas: dict, seleccion: dict) -> str:
+    necesita = set().union(*[_DATOS_POR_BLOQUE.get(b, set()) for b in seleccion]) if seleccion else set()
+    p = datos.perfil
+    ctx = {"empresa": datos.nombre, "ticker": datos.ticker, "sector": p.get("sector"),
+           "industria": p.get("industria"), "pais": p.get("pais"), "empleados": p.get("empleados"),
+           "ceo": p.get("ceo")}
+    if "descripcion" in necesita and p.get("descripcion"):
+        ctx["descripcion"] = str(p["descripcion"])[:1500]
+    if "ratios" in necesita:
+        ctx["ratios"] = [f"{r.nombre}: {r.valor} ({r.estado})" for r in resultados if r.estado != "info"]
+    if "accionistas" in necesita:
+        ctx["accionistas"] = datos.accionistas
+    if "insiders" in necesita:
+        ctx["insiders_12_meses"] = {k: v for k, v in resumen_insiders(datos).items() if k != "hay_datos"}
+    if "directivos" in necesita and not datos.directivos.empty:
+        cols = [c for c in ("Nombre", "Cargo", "Año nac.", "En el cargo desde") if c in datos.directivos]
+        ctx["directivos"] = datos.directivos[cols].head(8).to_dict(orient="records")
+    notas_sel = {k: v for k, v in notas.items() if v and k.split("|")[0] in seleccion}
+    if notas_sel:
+        ctx["notas_del_usuario"] = notas_sel
+    return json.dumps(ctx, ensure_ascii=False, default=str)
+
+
+_PRECIOS = {"haiku": (0.10, 0.50), "opus": (4.0, 20.0), "sonnet": (2.0, 10.0)}
+
+
+def _precio_modelo(modelo: str) -> tuple[float, float]:
+    return next((v for k, v in _PRECIOS.items() if k in modelo), _PRECIOS["sonnet"])
+
+
+def _n_criterios(seleccion: dict) -> int:
+    return sum(max(1, len(v)) for v in seleccion.values())
+
+
+def busqueda_util(seleccion: dict) -> bool:
+    return any(b in _BLOQUES_CON_BUSQUEDA for b in seleccion)
+
+
+def estimar_coste(seleccion: dict, modelo: str, buscar: bool, max_busquedas: int) -> float:
+    """Estimación previa (en dólares) para mostrar antes de lanzar el análisis."""
+    if not seleccion:
+        return 0.0
+    p_in, p_out = _precio_modelo(modelo)
+    n = _n_criterios(seleccion)
+    tok_in = 1500 + 400 * len(seleccion)
+    tok_out = 180 * n + 150
+    coste = tok_in / 1e6 * p_in + tok_out / 1e6 * p_out
+    if buscar and busqueda_util(seleccion):
+        b = min(max_busquedas, 1 + len(seleccion))
+        coste += b * 0.01 + b * 6000 / 1e6 * p_in  # búsqueda + texto de los resultados
+    return coste
+
+
+def analisis_ia(datos: DatosEmpresa, resultados, notas: dict, clave: str, seleccion: dict,
+                modelo: str = "claude-sonnet-5-5", buscar: bool = True, max_busquedas: int = 3) -> dict:
+    """Analiza solo los bloques/criterios elegidos.
+
+    `seleccion` = {bloque: [criterios]}; una lista vacía significa «el bloque entero, en resumen».
+    Devuelve {"texto", "fuentes": [(titulo, url)], "busquedas", "coste", "seleccion", "modelo", "fecha"}.
+    """
     import anthropic
 
     hoy = pd.Timestamp.today().strftime("%d/%m/%Y")
-    bloques = "\n".join(f"- {b}: {', '.join(items)}" for b, items in CHECKLIST.items())
+    buscar = buscar and busqueda_util(seleccion)
+
+    lineas = []
+    for bloque, crit in seleccion.items():
+        if bloque == NOTICIAS:
+            lineas.append(f"- {NOTICIAS}: las 5 más relevantes, cada una con fecha y una línea de por qué importa.")
+        elif crit:
+            lineas.append(f"- {bloque}, SOLO estos criterios: {'; '.join(crit)}")
+        else:
+            lineas.append(f"- {bloque} (visión general del bloque en un párrafo)")
+
     sistema = (
-        "Eres un analista de inversiones que ayuda a un inversor particular a revisar empresas. "
-        "Respondes en español, de forma clara y concreta. No das recomendaciones de compra o venta: "
-        "señalas fortalezas, riesgos y dudas a investigar. Si no sabes algo con seguridad, dilo "
-        "expresamente y no inventes cifras. "
+        "Eres un analista de inversiones que ayuda a un inversor particular. Respondes en español, "
+        "breve y al grano: frases cortas, sin introducciones ni repetir datos que ya te paso. "
+        "No das recomendaciones de compra o venta. Si no sabes algo con seguridad, dilo y no inventes cifras. "
         f"Hoy es {hoy}. "
-        + ("Usa la búsqueda web para comprobar hechos recientes y cita de dónde sale cada dato reciente."
-           if buscar else
-           "No tienes acceso a internet: tu conocimiento puede no estar actualizado, avísalo cuando un "
-           "punto dependa de hechos recientes.")
-    )
-    tareas_busqueda = (
-        "\n\nAntes de redactar, busca en internet (prioriza los últimos 12 meses):\n"
-        "1. Noticias recientes relevantes de la empresa (resultados, guías, adquisiciones, demandas, "
-        "regulación, escándalos).\n"
-        "2. Cambios en el equipo directivo o el consejo, y su historial.\n"
-        "3. Compras o ventas significativas de insiders y si forman parte de planes programados.\n"
-        "4. Situación de los principales competidores y nuevos entrantes.\n"
-        "5. Opinión del mercado sobre su ventaja competitiva.\n"
-        "Termina con una sección «Noticias recientes» con las 5 más relevantes, cada una con su fecha."
-        if buscar else ""
+        + ("Usa la búsqueda web solo para hechos recientes que cambien la valoración; no busques lo que ya sabes."
+           if buscar else "No tienes internet: avisa cuando un punto dependa de hechos recientes.")
     )
     pregunta = (
-        "Haz el análisis cualitativo de esta empresa siguiendo exactamente estos bloques de mi tabla:\n"
-        f"{bloques}\n\n"
-        "Para cada bloque: un párrafo breve y, al final, una valoración Favorable / Neutral / Desfavorable. "
-        "En 'Equipo directivo' comenta el skin in the game y las compras y ventas de insiders con los datos "
-        "que te paso. En 'Moat' indica qué ventajas competitivas tiene realmente y cuáles no. Termina con "
-        "una lista de 3-5 preguntas que debería investigar antes de invertir."
-        f"{tareas_busqueda}\n\n"
-        f"Datos:\n{_contexto(datos, resultados, notas)}"
+        "Analiza ÚNICAMENTE lo siguiente de esta empresa (no añadas otros bloques):\n"
+        + "\n".join(lineas)
+        + "\n\nFormato: un encabezado «### » por bloque; dentro, cada criterio en negrita con 2-3 frases y "
+        "al final de cada criterio «→ Favorable», «→ Neutral» o «→ Desfavorable». "
+        "En equipo directivo usa los datos de insiders que te paso (no comentes sueldos ni n.º de acciones: "
+        "el usuario ya los ve en la app)."
+        + f"\n\nDatos:\n{_contexto(datos, resultados, notas, seleccion)}"
     )
 
     cliente = anthropic.Anthropic(api_key=clave)
     mensajes = [{"role": "user", "content": pregunta}]
-    herramientas = []
-    if buscar:
-        herramientas = [{"type": "web_search_20250305", "name": "web_search", "max_uses": max_busquedas}]
+    herramientas = ([{"type": "web_search_20250305", "name": "web_search", "max_uses": max_busquedas}]
+                    if buscar else [])
+    max_tokens = min(6000, 400 + 350 * _n_criterios(seleccion))
 
     textos, fuentes = [], []
     busquedas, tok_in, tok_out = 0, 0, 0
     for _ in range(4):  # la búsqueda puede pausar el turno; se continúa hasta terminar
-        kwargs = dict(model=modelo, max_tokens=6000, system=sistema, messages=mensajes)
+        kwargs = dict(model=modelo, max_tokens=max_tokens, system=sistema, messages=mensajes)
         if herramientas:
             kwargs["tools"] = herramientas
         resp = cliente.messages.create(**kwargs)
@@ -188,11 +238,10 @@ def analisis_ia(datos: DatosEmpresa, resultados, notas: dict, clave: str,
             break
         mensajes = mensajes + [{"role": "assistant", "content": resp.content}]
 
-    # Coste orientativo con precios de Sonnet 5.5 (2 $ / 10 $ por millón) y 10 $ / 1.000 búsquedas
-    precios = {"haiku": (0.10, 0.50), "opus": (4.0, 20.0)}
-    p_in, p_out = next((v for k, v in precios.items() if k in modelo), (2.0, 10.0))
+    p_in, p_out = _precio_modelo(modelo)
     coste = tok_in / 1e6 * p_in + tok_out / 1e6 * p_out + busquedas * 0.01
-    return {"texto": "".join(textos), "fuentes": fuentes, "busquedas": busquedas, "coste": coste}
+    return {"texto": "".join(textos), "fuentes": fuentes, "busquedas": busquedas, "coste": coste,
+            "seleccion": seleccion, "modelo": modelo, "fecha": pd.Timestamp.today().strftime("%Y-%m-%d %H:%M")}
 
 
 def exportar_markdown(datos: DatosEmpresa, resultados, notas: dict, valoraciones: dict, texto_ia: str = "") -> str:

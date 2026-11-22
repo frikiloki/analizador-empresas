@@ -6,6 +6,7 @@ App de Streamlit que revisa una empresa a partir de su ticker con mi tabla de va
 - **Gráficos**: precio frente a BPA, magnitudes principales, márgenes, ROIC, acciones diluidas y múltiplos históricos.
 - **Análisis cualitativo**: modelo de negocio, ciclicidad, I+D, *skin in the game*, compras y ventas de insiders, accionistas institucionales y la checklist completa (macro, micro, equipo directivo y moat), con informe descargable.
 - **Competidores**: comparativa de márgenes, rentabilidad, deuda y múltiplos.
+- **Historial**: guarda cada análisis con su fecha y compara cómo ha cambiado cada ratio entre dos fechas.
 
 ## Fuentes de datos
 
@@ -18,8 +19,11 @@ Para acciones fuera de EE. UU. usa el sufijo de Yahoo: `ITX.MC`, `MC.PA`, `SAP.D
 
 ```toml
 FMP_API_KEY = "tu_clave"
-# Opcional, para el análisis cualitativo redactado por IA:
-# ANTHROPIC_API_KEY = "tu_clave"
+# Opcional, para el análisis cualitativo con IA (por bloques o criterios):
+ANTHROPIC_API_KEY = "tu_clave"
+# Opcional, para guardar el historial de análisis en un repositorio PRIVADO:
+GITHUB_TOKEN = "github_pat_..."
+GITHUB_REPO_DATOS = "usuario/analizador-datos"
 ```
 
 Nunca subas las claves al repositorio.
