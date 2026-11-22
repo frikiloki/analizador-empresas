@@ -178,20 +178,24 @@ def wacc(datos: DatosEmpresa, p: Parametros) -> tuple[float, dict]:
     return w, {"beta": beta, "ke": ke, "kd": kd, "t": t, "peso_deuda": d / (e + d)}
 
 
-def alfa(datos: DatosEmpresa, indice: pd.Series, anios: int = 5) -> tuple[float, float, float]:
-    """Rentabilidad anual de la acción menos la del índice (solo precio) en `anios` años."""
+def alfa(datos: DatosEmpresa, indice: pd.Series, anios: int = 5) -> tuple[float, float, float, float]:
+    """Devuelve (diferencia anual, rentab. anual acción, rentab. anual índice, alfa como cociente).
+
+    El alfa como cociente es lo que ha crecido la acción entre lo que ha crecido el índice
+    en el periodo (solo precio): > 1 bate al índice, < 1 lo hace peor."""
     p = datos.precios.dropna()
     i = indice.dropna()
     if p.empty or i.empty:
-        return np.nan, np.nan, np.nan
+        return np.nan, np.nan, np.nan, np.nan
     desde = max(p.index[-1] - pd.DateOffset(years=anios), p.index[0], i.index[0])
     p, i = p[p.index >= desde], i[i.index >= desde]
     if len(p) < 50 or len(i) < 50:
-        return np.nan, np.nan, np.nan
+        return np.nan, np.nan, np.nan, np.nan
+    i = i[i.index <= p.index[-1]]
     n = (p.index[-1] - p.index[0]).days / 365.25
-    ra = (p.iloc[-1] / p.iloc[0]) ** (1 / n) - 1
-    ri = (i.iloc[-1] / i.iloc[0]) ** (1 / n) - 1
-    return ra - ri, ra, ri
+    crec_a, crec_i = p.iloc[-1] / p.iloc[0], i.iloc[-1] / i.iloc[0]
+    ra, ri = crec_a ** (1 / n) - 1, crec_i ** (1 / n) - 1
+    return ra - ri, ra, ri, crec_a / crec_i
 
 
 # ---------------------------------------------------------------------------
@@ -439,13 +443,13 @@ def analizar(datos: DatosEmpresa, indice: pd.Series, p: Parametros | None = None
                            "Valores negativos = el circulante consume caja."))
 
     # 16. Alfa frente al índice
-    a, ra, ri = alfa(datos, indice)
-    if pd.isna(a):
-        r.append(_sin_datos("16", "Alfa vs índice (5 años)", "> 0: bate al índice"))
+    a, ra, ri, alfa_ratio = alfa(datos, indice)
+    if pd.isna(alfa_ratio):
+        r.append(_sin_datos("16", "Alfa vs índice (5 años)", "> 1 bate al índice · < 1 peor"))
     else:
-        r.append(Resultado("16", "Alfa vs índice (5 años)", f"{_pct(a)} anual", "> 0: bate al índice",
-                           OK if a > 0 else MAL,
-                           f"Acción {_pct(ra)} anual vs índice {_pct(ri)} anual (solo precio, sin dividendos)."))
+        r.append(Resultado("16", "Alfa vs índice (5 años)", _num(alfa_ratio), "> 1 bate al índice · < 1 peor",
+                           OK if alfa_ratio > 1 else MAL,
+                           "Bate al índice." if alfa_ratio > 1 else "Peor que el índice."))
 
     # 17. ROIC
     if pd.isna(roic_ult):
