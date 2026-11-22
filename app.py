@@ -225,7 +225,7 @@ with tab_graf:
 with tab_cuali:
     clave_estado = f"cuali_{ticker}"
     if clave_estado not in st.session_state:
-        st.session_state[clave_estado] = {"notas": {}, "valoraciones": {}, "ia": ""}
+        st.session_state[clave_estado] = {"notas": {}, "valoraciones": {}, "ia": {}}
     estado_c = st.session_state[clave_estado]
 
     st.subheader("Datos de la empresa")
@@ -275,16 +275,37 @@ with tab_cuali:
     st.divider()
     st.subheader("Análisis con IA")
     if CLAVE_IA:
+        o1, o2 = st.columns([2, 1])
+        buscar = o1.toggle("Buscar noticias recientes en internet", value=True,
+                           help="La IA busca noticias, cambios de directivos, operaciones de insiders y competidores. "
+                                "Coste orientativo: 0,10-0,15 $ por empresa (sin búsqueda ≈ 0,04 $).")
+        max_b = o2.slider("Máx. búsquedas", 1, 10, 5, disabled=not buscar)
         if st.button("Generar análisis cualitativo con IA", type="primary"):
-            with st.spinner("Analizando… (puede tardar un minuto)"):
+            with st.spinner("Buscando información y analizando… (1-2 minutos)"):
                 try:
-                    estado_c["ia"] = cual.analisis_ia(datos, resultados, estado_c["notas"], CLAVE_IA, MODELO_IA)
+                    estado_c["ia"] = cual.analisis_ia(datos, resultados, estado_c["notas"], CLAVE_IA,
+                                                      MODELO_IA, buscar=buscar, max_busquedas=max_b)
                 except Exception as e:
-                    st.error(f"No se ha podido generar el análisis: {e}")
-        if estado_c["ia"]:
-            st.markdown(estado_c["ia"])
-            st.caption("Redactado por IA con los datos de la app y su conocimiento general, que puede no estar al día. "
-                       "Contrasta lo importante.")
+                    if buscar:
+                        st.warning("La búsqueda web ha fallado (puede que no esté activada en tu cuenta de "
+                                   f"Anthropic: Settings → Privacy en platform.claude.com). Se repite sin búsqueda. "
+                                   f"Detalle: {e}")
+                        try:
+                            estado_c["ia"] = cual.analisis_ia(datos, resultados, estado_c["notas"], CLAVE_IA,
+                                                              MODELO_IA, buscar=False)
+                        except Exception as e2:
+                            st.error(f"No se ha podido generar el análisis: {e2}")
+                    else:
+                        st.error(f"No se ha podido generar el análisis: {e}")
+        ia = estado_c["ia"]
+        if isinstance(ia, dict) and ia.get("texto"):
+            st.markdown(ia["texto"])
+            if ia["fuentes"]:
+                with st.expander(f"Fuentes consultadas ({len(ia['fuentes'])})"):
+                    for titulo, url in ia["fuentes"]:
+                        st.markdown(f"- [{titulo}]({url})")
+            st.caption(f"Redactado por IA ({MODELO_IA}) · {ia['busquedas']} búsquedas · coste aprox. "
+                       f"{ia['coste']:.3f} $. Contrasta lo importante en las fuentes.")
     else:
         st.caption("Opcional: añade `ANTHROPIC_API_KEY` en los secretos de Streamlit para que la IA redacte "
                    "el análisis de entorno, equipo directivo y moat siguiendo tu tabla.")
@@ -304,7 +325,11 @@ with tab_cuali:
                 estado_c["notas"][k] = c2.text_input("Notas", value=estado_c["notas"].get(k, ""),
                                                      key=f"n_{ticker}_{k}", label_visibility="hidden")
 
-    informe = cual.exportar_markdown(datos, resultados, estado_c["notas"], estado_c["valoraciones"], estado_c["ia"])
+    ia = estado_c["ia"] if isinstance(estado_c["ia"], dict) else {}
+    texto_ia = ia.get("texto", "")
+    if ia.get("fuentes"):
+        texto_ia += "\n\n### Fuentes\n" + "\n".join(f"- [{t}]({u})" for t, u in ia["fuentes"])
+    informe = cual.exportar_markdown(datos, resultados, estado_c["notas"], estado_c["valoraciones"], texto_ia)
     st.download_button("⬇️ Descargar informe (Markdown)", informe, file_name=f"analisis_{ticker}.md",
                        mime="text/markdown")
 

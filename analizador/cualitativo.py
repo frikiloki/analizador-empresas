@@ -119,16 +119,34 @@ def _contexto(datos: DatosEmpresa, resultados, notas: dict) -> str:
 
 
 def analisis_ia(datos: DatosEmpresa, resultados, notas: dict, clave: str,
-                modelo: str = "claude-sonnet-5-5") -> str:
+                modelo: str = "claude-sonnet-5-5", buscar: bool = True,
+                max_busquedas: int = 5) -> dict:
+    """Devuelve {"texto", "fuentes": [(titulo, url)], "busquedas", "coste"}."""
     import anthropic
 
+    hoy = pd.Timestamp.today().strftime("%d/%m/%Y")
     bloques = "\n".join(f"- {b}: {', '.join(items)}" for b, items in CHECKLIST.items())
     sistema = (
         "Eres un analista de inversiones que ayuda a un inversor particular a revisar empresas. "
         "Respondes en español, de forma clara y concreta. No das recomendaciones de compra o venta: "
         "señalas fortalezas, riesgos y dudas a investigar. Si no sabes algo con seguridad, dilo "
-        "expresamente y no inventes cifras. Tu conocimiento puede no estar actualizado: avísalo "
-        "cuando un punto dependa de hechos recientes."
+        "expresamente y no inventes cifras. "
+        f"Hoy es {hoy}. "
+        + ("Usa la búsqueda web para comprobar hechos recientes y cita de dónde sale cada dato reciente."
+           if buscar else
+           "No tienes acceso a internet: tu conocimiento puede no estar actualizado, avísalo cuando un "
+           "punto dependa de hechos recientes.")
+    )
+    tareas_busqueda = (
+        "\n\nAntes de redactar, busca en internet (prioriza los últimos 12 meses):\n"
+        "1. Noticias recientes relevantes de la empresa (resultados, guías, adquisiciones, demandas, "
+        "regulación, escándalos).\n"
+        "2. Cambios en el equipo directivo o el consejo, y su historial.\n"
+        "3. Compras o ventas significativas de insiders y si forman parte de planes programados.\n"
+        "4. Situación de los principales competidores y nuevos entrantes.\n"
+        "5. Opinión del mercado sobre su ventaja competitiva.\n"
+        "Termina con una sección «Noticias recientes» con las 5 más relevantes, cada una con su fecha."
+        if buscar else ""
     )
     pregunta = (
         "Haz el análisis cualitativo de esta empresa siguiendo exactamente estos bloques de mi tabla:\n"
@@ -136,15 +154,45 @@ def analisis_ia(datos: DatosEmpresa, resultados, notas: dict, clave: str,
         "Para cada bloque: un párrafo breve y, al final, una valoración Favorable / Neutral / Desfavorable. "
         "En 'Equipo directivo' comenta el skin in the game y las compras y ventas de insiders con los datos "
         "que te paso. En 'Moat' indica qué ventajas competitivas tiene realmente y cuáles no. Termina con "
-        "una lista de 3-5 preguntas que debería investigar antes de invertir.\n\n"
+        "una lista de 3-5 preguntas que debería investigar antes de invertir."
+        f"{tareas_busqueda}\n\n"
         f"Datos:\n{_contexto(datos, resultados, notas)}"
     )
+
     cliente = anthropic.Anthropic(api_key=clave)
-    resp = cliente.messages.create(
-        model=modelo, max_tokens=4000, system=sistema,
-        messages=[{"role": "user", "content": pregunta}],
-    )
-    return "".join(b.text for b in resp.content if getattr(b, "type", "") == "text")
+    mensajes = [{"role": "user", "content": pregunta}]
+    herramientas = []
+    if buscar:
+        herramientas = [{"type": "web_search_20250305", "name": "web_search", "max_uses": max_busquedas}]
+
+    textos, fuentes = [], []
+    busquedas, tok_in, tok_out = 0, 0, 0
+    for _ in range(4):  # la búsqueda puede pausar el turno; se continúa hasta terminar
+        kwargs = dict(model=modelo, max_tokens=6000, system=sistema, messages=mensajes)
+        if herramientas:
+            kwargs["tools"] = herramientas
+        resp = cliente.messages.create(**kwargs)
+        u = resp.usage
+        tok_in += getattr(u, "input_tokens", 0) or 0
+        tok_out += getattr(u, "output_tokens", 0) or 0
+        stu = getattr(u, "server_tool_use", None)
+        busquedas += (getattr(stu, "web_search_requests", 0) or 0) if stu else 0
+        for b in resp.content:
+            if getattr(b, "type", "") == "text":
+                textos.append(b.text)
+                for c in getattr(b, "citations", None) or []:
+                    url = getattr(c, "url", None)
+                    if url and url not in [f[1] for f in fuentes]:
+                        fuentes.append((getattr(c, "title", None) or url, url))
+        if resp.stop_reason != "pause_turn":
+            break
+        mensajes = mensajes + [{"role": "assistant", "content": resp.content}]
+
+    # Coste orientativo con precios de Sonnet 5.5 (2 $ / 10 $ por millón) y 10 $ / 1.000 búsquedas
+    precios = {"haiku": (0.10, 0.50), "opus": (4.0, 20.0)}
+    p_in, p_out = next((v for k, v in precios.items() if k in modelo), (2.0, 10.0))
+    coste = tok_in / 1e6 * p_in + tok_out / 1e6 * p_out + busquedas * 0.01
+    return {"texto": "".join(textos), "fuentes": fuentes, "busquedas": busquedas, "coste": coste}
 
 
 def exportar_markdown(datos: DatosEmpresa, resultados, notas: dict, valoraciones: dict, texto_ia: str = "") -> str:
